@@ -1,0 +1,276 @@
+# .gitea/workflows/plan.yaml
+#
+# Triggered on every Pull Request / Merge Request targeting main or any
+# environment branch. Runs terraform plan and posts the output as a PR comment.
+# This is the primary GATE — reviewers must see a passing plan before merging.
+
+name: "Terraform Plan"
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "env/*"
+    paths:
+      - "terraform/**"
+      - ".gitea/workflows/**"
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_IN_AUTOMATION: "true"
+  # Prevents interactive prompts in CI
+  TF_INPUT: "false"
+
+jobs:
+  # ── Determine which environments changed ──────────────────────────────────
+  detect-changes:
+    name: "Detect Changed Environments"
+    runs-on: ubuntu-latest
+    outputs:
+      dev:      ${{ steps.changes.outputs.dev }}
+      staging:  ${{ steps.changes.outputs.staging }}
+      prod:     ${{ steps.changes.outputs.prod }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed terraform environments
+        id: changes
+        run: |
+          BASE_SHA="${{ gitea.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ gitea.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          # Check if module changed — treat as all-environments change
+          MODULE_CHANGED=$(echo "$CHANGED" | grep -c "terraform/modules/" || true)
+
+          for env in dev staging prod; do
+            ENV_CHANGED=$(echo "$CHANGED" | grep -c "terraform/environments/$env/" || true)
+            if [ "$ENV_CHANGED" -gt 0 ] || [ "$MODULE_CHANGED" -gt 0 ]; then
+              echo "$env=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$env=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+  # ── Validate formatting and syntax (all paths) ────────────────────────────
+  validate:
+    name: "Validate & Format"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check -recursive terraform/
+        id: fmt
+
+      - name: Terraform Validate (module)
+        working-directory: terraform/modules/observability_pipeline
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: Post format failure comment
+        if: failure() && steps.fmt.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## ❌ Terraform Format Check Failed
+            Run \`terraform fmt -recursive terraform/\` locally to fix formatting.`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ── Plan: Dev ─────────────────────────────────────────────────────────────
+  plan-dev:
+    name: "Plan: Dev"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate]
+    if: needs.detect-changes.outputs.dev == 'true'
+    environment: dev-plan  # read-only environment — no approval gate needed for plan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/dev
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/dev
+        env:
+          TF_VAR_datadog_api_key: ${{ secrets.DD_API_KEY_DEV }}
+          TF_VAR_datadog_app_key: ${{ secrets.DD_APP_KEY_DEV }}
+          AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: |
+          terraform plan -out=tfplan.dev -no-color 2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Post Plan Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/dev/plan_output.txt', 'utf8');
+            const maxLen = 65000;
+            const truncated = plan.length > maxLen
+              ? plan.substring(0, maxLen) + '\n\n... [truncated — see runner logs for full output]'
+              : plan;
+
+            const body = `## 🔍 Terraform Plan — Dev
+            <details>
+            <summary>Click to expand plan output</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>
+
+            *Triggered by: @${{ gitea.actor }} | Commit: \`${{ gitea.sha }}\`*`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode != '0' && steps.plan.outputs.exitcode != '2'
+        run: exit 1
+
+  # ── Plan: Staging ─────────────────────────────────────────────────────────
+  plan-staging:
+    name: "Plan: Staging"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate]
+    if: needs.detect-changes.outputs.staging == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/staging
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/staging
+        env:
+          TF_VAR_datadog_api_key: ${{ secrets.DD_API_KEY_STAGING }}
+          TF_VAR_datadog_app_key: ${{ secrets.DD_APP_KEY_STAGING }}
+          AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: |
+          terraform plan -out=tfplan.staging -no-color 2>&1 | tee plan_output.txt
+
+      - name: Post Plan Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/staging/plan_output.txt', 'utf8');
+            const truncated = plan.length > 65000 ? plan.substring(0, 65000) + '\n...[truncated]' : plan;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔍 Terraform Plan — Staging\n\n<details><summary>Expand</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n</details>`
+            });
+
+  # ── Plan: Prod ────────────────────────────────────────────────────────────
+  plan-prod:
+    name: "Plan: Prod"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate]
+    if: needs.detect-changes.outputs.prod == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/prod
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/prod
+        env:
+          TF_VAR_datadog_api_key: ${{ secrets.DD_API_KEY_PROD }}
+          TF_VAR_datadog_app_key: ${{ secrets.DD_APP_KEY_PROD }}
+          AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: |
+          terraform plan -out=tfplan.prod -no-color 2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Post Plan Comment (Prod — highlighted)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/prod/plan_output.txt', 'utf8');
+            const truncated = plan.length > 65000 ? plan.substring(0, 65000) + '\n...[truncated]' : plan;
+
+            // Extract summary line for visibility
+            const summary = plan.match(/Plan: .*/)?.[0] || 'See details';
+
+            const body = `## ⚠️ Terraform Plan — **PRODUCTION**
+
+            > **${summary}**
+            > This MR will modify production Observability Pipeline processors.
+            > Two approvals required before merge is permitted.
+
+            <details>
+            <summary>Full plan output</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode != '0' && steps.plan.outputs.exitcode != '2'
+        run: exit 1
