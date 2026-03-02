@@ -313,7 +313,157 @@ terraform apply -auto-approve  # after manually reverting main.tf
 
 ---
 
-## 12. Observability of the Pipeline Itself
+## 12. Automation Bypass Path Setup
+
+### Overview
+
+The `automation` branch is a dedicated bypass lane for trusted internal services.
+Pushes to it skip the human review gate and apply immediately, but still:
+- Verify the pushing actor matches `AUTOMATION_BOT_USERNAME`
+- Sync live Datadog state before every apply
+- Create an audit PR from `automation → main` after every successful apply
+
+### Step 1 — Create the automation service account
+
+In GitHub/Gitea, create a dedicated machine user:
+- Username: `automation-bot` (or your naming convention)
+- No 2FA required (it's a service account)
+- Generate a fine-grained PAT scoped to **this repo only** with `Contents: Read/Write`
+
+### Step 2 — Add secrets and variables
+
+| Secret / Variable | Value |
+|-------------------|-------|
+| `AUTOMATION_BOT_TOKEN` (secret) | The service account PAT |
+| `AUTOMATION_BOT_USERNAME` (variable) | `automation-bot` |
+| `DD_PIPELINE_IDS_DEV` (secret) | Space-separated pipeline IDs for dev |
+| `DD_PIPELINE_IDS_STAGING` (secret) | Space-separated pipeline IDs for staging |
+| `DD_PIPELINE_IDS_PROD` (secret) | Space-separated pipeline IDs for prod |
+
+### Step 3 — Create the `automation` branch
+
+```bash
+git checkout -b automation
+git push origin automation
+```
+
+### Step 4 — Lock down the `automation` branch
+
+Go to **Repository → Settings → Branches → Add rule** for `automation`:
+
+| Setting | Value |
+|---------|-------|
+| Require pull request | ❌ Disabled (bots push directly) |
+| Restrict who can push | ✅ **Only `automation-bot`** |
+| Allow force pushes | ❌ Disabled |
+| Allow deletions | ❌ Disabled |
+
+This means no human can push to `automation` — only the service account can.
+
+### Step 5 — Create the bypass Gitea environments
+
+Go to **Repository → Settings → Environments**:
+
+**`staging-deploy-auto`**
+- Required reviewers: none
+- Deployment branch: `automation` only
+
+**`prod-deploy-auto`**
+- Required reviewers: none
+- Deployment branch: `automation` only
+- No wait timer
+
+These environments are referenced by `automation-sync.yaml` only, so the
+regular `apply.yaml` on `main` still uses the gated `prod-deploy` environment.
+
+### Step 6 — How your internal service submits changes
+
+Your service uses `scripts/automation_push.py` (or replicates its logic):
+
+```python
+# Install requirements (stdlib only — no pip deps)
+# Set environment variables:
+os.environ["AUTOMATION_BOT_TOKEN"] = "<service-account-pat>"
+os.environ["DD_API_KEY"]           = "<dd-api-key-prod>"
+os.environ["DD_APP_KEY"]           = "<dd-app-key-prod>"
+os.environ["REPO_URL"]             = "https://github.com/18LEDs/op-terraform-fix"
+```
+
+Create a patch file describing the change:
+
+```json
+// processor_patch.json — add a new dedup processor
+{
+  "operation": "upsert_processor",
+  "group_id": "enrich-to-datadog",
+  "after_processor_id": "parse-raw-json",
+  "processor": {
+    "id": "auto-dedup-sessions",
+    "type": "dedupe",
+    "fields": ["session_id", "user_id", "timestamp"]
+  }
+}
+```
+
+Supported operations:
+- `upsert_processor` — add or update a processor within a group
+- `remove_processor` — remove a processor by ID
+- `reorder_processors` — change processor execution order
+- `replace_group` — replace an entire processor group
+
+Run the push:
+
+```bash
+python3 scripts/automation_push.py \
+  --env prod \
+  --pipeline-id <your-pipeline-id> \
+  --pipeline-name "prod-security-compliance" \
+  --patch-file processor_patch.json \
+  --commit-message "Auto: add session dedup processor"
+
+# Test without pushing:
+python3 scripts/automation_push.py ... --dry-run
+```
+
+### Step 7 — Reviewing automation audit PRs
+
+After every successful automation apply, a PR is opened from `automation → main`.
+Reviewers should:
+1. Check the diff matches the expected processor change
+2. Merge to keep `main` in sync with deployed state
+3. If the change was wrong, revert on `main` and the normal CI/CD path will correct Datadog
+
+---
+
+## 13. Live State Sync — How It Works
+
+Before every plan AND every apply, `scripts/sync_live_state.py` runs and:
+
+1. Calls `GET /api/v2/remote_configuration/products/obs_pipelines/pipelines/<id>`
+2. Extracts the current `processor_groups` from the live response
+3. Writes `live_processors.auto.tfvars.json` into the environment directory
+4. Terraform automatically picks this up (`.auto.tfvars.json` files are loaded automatically)
+5. Detects drift between the live state and what was previously in the file
+6. Writes `drift_report.txt` which the plan workflow posts in the PR comment
+
+**Why this matters:** Without live sync, if someone modified a processor in the
+Datadog UI directly, or if another tool touched the pipeline, your Terraform plan
+would be based on stale state. The live sync ensures:
+- Plans show the real delta between current live state and desired state
+- Applies never accidentally revert changes made by other tools
+- Drift is surfaced visibly in every PR for reviewers to see
+
+**New secrets needed:**
+
+| Secret | Description |
+|--------|-------------|
+| `DD_PIPELINE_IDS_DEV` | Space-separated list of pipeline IDs to sync in dev |
+| `DD_PIPELINE_IDS_STAGING` | Same for staging |
+| `DD_PIPELINE_IDS_PROD` | Same for prod |
+
+---
+
+## 14. Observability of the Pipeline Itself
 
 Monitor the health of your CI/CD pipeline:
 

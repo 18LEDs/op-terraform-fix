@@ -1,0 +1,284 @@
+# .gitea/workflows/automation-sync.yaml
+#
+# This workflow runs ONLY on the `automation` branch.
+# It is the entry point for trusted internal services that need to push
+# processor configuration changes without going through the human review gate.
+#
+# How the trusted application submits changes:
+#   1. App authenticates with a dedicated GitHub/Gitea service account token
+#      (AUTOMATION_BOT_TOKEN secret — scoped to push to `automation` only)
+#   2. App modifies the relevant terraform/environments/<env>/main.tf
+#   3. App pushes the commit to the `automation` branch
+#   4. This workflow triggers, syncs live state, and applies immediately
+#   5. After apply, the workflow opens a PR from automation → main so the
+#      change is recorded in history and reviewers are notified (audit trail)
+#
+# SECURITY CONTROLS:
+#   - The `automation` branch has branch protection: only AUTOMATION_BOT_TOKEN
+#     user can push to it (configured in Gitea branch protection rules)
+#   - The `prod-deploy-auto` environment in Gitea has NO required reviewers
+#     but IS restricted to the `automation` branch only
+#   - All applies are logged and an auto-PR is created for human visibility
+
+name: "Automation Bypass — Apply"
+
+on:
+  push:
+    branches:
+      - automation
+    paths:
+      - "terraform/**"
+
+env:
+  TF_VERSION:       "1.7.5"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT:         "false"
+  PYTHON_VERSION:   "3.11"
+
+jobs:
+  # ── Validate the push came from the automation service account ─────────────
+  verify-actor:
+    name: "Verify Automation Actor"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check committer identity
+        run: |
+          ACTOR="${{ gitea.actor }}"
+          ALLOWED_ACTOR="${{ vars.AUTOMATION_BOT_USERNAME }}"
+
+          echo "Push actor:   $ACTOR"
+          echo "Allowed actor: $ALLOWED_ACTOR"
+
+          if [ "$ACTOR" != "$ALLOWED_ACTOR" ]; then
+            echo "::error::Push to automation branch from unauthorized actor: $ACTOR"
+            echo "Only the automation service account ($ALLOWED_ACTOR) may push to this branch."
+            exit 1
+          fi
+          echo "✅ Actor verified: $ACTOR"
+
+  # ── Detect which environments changed ────────────────────────────────────
+  detect-changes:
+    name: "Detect Changed Environments"
+    runs-on: ubuntu-latest
+    needs: verify-actor
+    outputs:
+      dev:     ${{ steps.changes.outputs.dev }}
+      staging: ${{ steps.changes.outputs.staging }}
+      prod:    ${{ steps.changes.outputs.prod }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed environments
+        id: changes
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          MODULE_CHANGED=$(echo "$CHANGED" | grep -c "terraform/modules/" || true)
+          for env in dev staging prod; do
+            ENV_CHANGED=$(echo "$CHANGED" | grep -c "terraform/environments/$env/" || true)
+            if [ "$ENV_CHANGED" -gt 0 ] || [ "$MODULE_CHANGED" -gt 0 ]; then
+              echo "$env=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$env=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+  # ── Apply: Dev (auto) ─────────────────────────────────────────────────────
+  apply-dev:
+    name: "Auto Apply: Dev"
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.dev == 'true'
+    environment: dev-deploy
+    concurrency:
+      group: tf-apply-dev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live state
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_DEV }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_DEV }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env dev \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_DEV }} \
+            --out-dir terraform/environments/dev
+
+      - name: Terraform Init + Apply
+        working-directory: terraform/environments/dev
+        env:
+          TF_VAR_datadog_api_key: ${{ secrets.DD_API_KEY_DEV }}
+          TF_VAR_datadog_app_key: ${{ secrets.DD_APP_KEY_DEV }}
+          AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: |
+          terraform init
+          terraform apply -auto-approve -no-color
+
+  # ── Apply: Staging (auto) ────────────────────────────────────────────────
+  apply-staging:
+    name: "Auto Apply: Staging"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, apply-dev]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.staging == 'true' &&
+      (needs.apply-dev.result == 'success' || needs.apply-dev.result == 'skipped')
+    # prod-deploy-auto has no required reviewers — bypass gate
+    environment: staging-deploy-auto
+    concurrency:
+      group: tf-apply-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live state
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_STAGING }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_STAGING }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env staging \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_STAGING }} \
+            --out-dir terraform/environments/staging
+
+      - name: Terraform Init + Apply
+        working-directory: terraform/environments/staging
+        env:
+          TF_VAR_datadog_api_key: ${{ secrets.DD_API_KEY_STAGING }}
+          TF_VAR_datadog_app_key: ${{ secrets.DD_APP_KEY_STAGING }}
+          AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: |
+          terraform init
+          terraform apply -auto-approve -no-color
+
+  # ── Apply: Prod (auto — no approval gate) ────────────────────────────────
+  apply-prod:
+    name: "Auto Apply: Prod"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, apply-staging]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.prod == 'true' &&
+      (needs.apply-staging.result == 'success' || needs.apply-staging.result == 'skipped')
+    environment: prod-deploy-auto
+    concurrency:
+      group: tf-apply-prod
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live state
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_PROD }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_PROD }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env prod \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_PROD }} \
+            --out-dir terraform/environments/prod
+
+      - name: Terraform Init + Apply
+        working-directory: terraform/environments/prod
+        env:
+          TF_VAR_datadog_api_key: ${{ secrets.DD_API_KEY_PROD }}
+          TF_VAR_datadog_app_key: ${{ secrets.DD_APP_KEY_PROD }}
+          AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
+        run: |
+          terraform init
+          terraform plan -no-color   # logged for audit even without approval gate
+          terraform apply -auto-approve -no-color
+
+      - name: Log automation apply for audit
+        if: success()
+        run: |
+          echo "🤖 AUTOMATION APPLY COMPLETE"
+          echo "Actor:  ${{ gitea.actor }}"
+          echo "Commit: ${{ gitea.sha }}"
+          echo "Ref:    ${{ gitea.ref }}"
+          echo "Time:   $(date -u)"
+
+  # ── Open a PR from automation → main (audit trail) ───────────────────────
+  open-audit-pr:
+    name: "Open Audit PR"
+    runs-on: ubuntu-latest
+    needs: [apply-dev, apply-staging, apply-prod]
+    if: always() && (needs.apply-prod.result == 'success' || needs.apply-staging.result == 'success' || needs.apply-dev.result == 'success')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AUTOMATION_BOT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Create PR from automation → main
+        env:
+          GH_TOKEN: ${{ secrets.AUTOMATION_BOT_TOKEN }}
+        run: |
+          # Check if a PR already exists for this automation push
+          EXISTING=$(gh pr list \
+            --head automation \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_SHA="${{ gitea.sha }}"
+          ACTOR="${{ gitea.actor }}"
+
+          PR_BODY="## 🤖 Automation Apply — Audit Record
+
+          This PR was automatically created to provide a human-visible audit trail
+          of a processor configuration change applied via the automation bypass path.
+
+          **The change has already been applied to Datadog.**
+
+          | Field | Value |
+          |-------|-------|
+          | Applied by | \`$ACTOR\` (automation service account) |
+          | Commit | \`$COMMIT_SHA\` |
+          | Message | $COMMIT_MSG |
+          | Applied at | $(date -u) |
+
+          ### What to do with this PR
+          - Review the diff to confirm the change is expected
+          - Merge to keep \`main\` in sync with what's deployed
+          - Or add a commit to \`main\` to override if the change was incorrect
+
+          > ⚠️ Do **not** close without merging unless the change is being reverted."
+
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already exists — adding a comment instead"
+            gh pr comment "$EXISTING" --body "Additional automation apply: commit \`$COMMIT_SHA\` — $COMMIT_MSG"
+          else
+            gh pr create \
+              --title "🤖 [Automation] $COMMIT_MSG" \
+              --body "$PR_BODY" \
+              --head automation \
+              --base main \
+              --label "automation" \
+              --label "audit-record"
+          fi

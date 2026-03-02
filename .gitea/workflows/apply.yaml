@@ -1,10 +1,16 @@
 # .gitea/workflows/apply.yaml
 #
-# Triggered ONLY on push to main (i.e., after an MR is approved and merged).
-# Runs terraform apply for each environment whose files changed in the merge commit.
+# Triggered on:
+#   - push to `main`      — standard human-reviewed GitOps path
+#   - push to `automation` — trusted service bypass path (no approval gates)
 #
-# Prod apply is gated behind a Gitea "environment" that requires manual approval
-# from a designated approver group (configured in Gitea UI — see docs/runbook.md).
+# Live-sync: Before every apply, the current Datadog API state is fetched and
+# written to live_processors.auto.tfvars.json. This guarantees Terraform always
+# applies against the real current state of each pipeline, catching any out-of-band
+# changes made directly in the Datadog UI or by other tooling.
+#
+# Prod apply on main is gated behind a Gitea "environment" requiring manual approval.
+# Prod apply on automation branch skips that gate entirely.
 
 name: "Terraform Apply"
 
@@ -12,6 +18,7 @@ on:
   push:
     branches:
       - main
+      - automation
     paths:
       - "terraform/**"
 
@@ -19,6 +26,7 @@ env:
   TF_VERSION:       "1.7.5"
   TF_IN_AUTOMATION: "true"
   TF_INPUT:         "false"
+  PYTHON_VERSION:   "3.11"
 
 jobs:
   # ── Determine which environments changed in this merge ────────────────────
@@ -26,9 +34,10 @@ jobs:
     name: "Detect Changed Environments"
     runs-on: ubuntu-latest
     outputs:
-      dev:     ${{ steps.changes.outputs.dev }}
-      staging: ${{ steps.changes.outputs.staging }}
-      prod:    ${{ steps.changes.outputs.prod }}
+      dev:            ${{ steps.changes.outputs.dev }}
+      staging:        ${{ steps.changes.outputs.staging }}
+      prod:           ${{ steps.changes.outputs.prod }}
+      is_automation:  ${{ steps.changes.outputs.is_automation }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,13 +59,19 @@ jobs:
             fi
           done
 
+          # Flag whether this is an automation branch push
+          if [ "${{ gitea.ref_name }}" = "automation" ]; then
+            echo "is_automation=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_automation=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── Apply: Dev ────────────────────────────────────────────────────────────
   apply-dev:
     name: "Apply: Dev"
     runs-on: ubuntu-latest
     needs: detect-changes
     if: needs.detect-changes.outputs.dev == 'true'
-    # "dev-deploy" environment has no approval gate — auto-deploys
     environment: dev-deploy
     concurrency:
       group: tf-apply-dev
@@ -64,10 +79,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Live sync: always apply against current Datadog state ───────────
+      - name: Sync live pipeline state from Datadog
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_DEV }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_DEV }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env dev \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_DEV }} \
+            --out-dir terraform/environments/dev
+          echo "=== Live sync complete (dev) ==="
+          cat terraform/environments/dev/drift_report.txt
 
       - name: Terraform Init
         working-directory: terraform/environments/dev
@@ -87,31 +120,46 @@ jobs:
 
       - name: Notify on failure
         if: failure()
-        run: |
-          echo "::error::Dev apply failed — check Terraform output above"
-          # Add your alerting hook here (e.g., curl to Slack webhook)
+        run: echo "::error::Dev apply failed — check Terraform output above"
 
   # ── Apply: Staging ────────────────────────────────────────────────────────
   apply-staging:
     name: "Apply: Staging"
     runs-on: ubuntu-latest
     needs: [detect-changes, apply-dev]
-    # Staging waits for dev to succeed (sequential promotion)
     if: |
       always() &&
       needs.detect-changes.outputs.staging == 'true' &&
       (needs.apply-dev.result == 'success' || needs.apply-dev.result == 'skipped')
-    environment: staging-deploy  # 1 approval required (configured in Gitea UI)
+    # Automation branch bypasses the approval gate; main branch requires it
+    environment: ${{ needs.detect-changes.outputs.is_automation == 'true' && 'staging-deploy-auto' || 'staging-deploy' }}
     concurrency:
       group: tf-apply-staging
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live pipeline state from Datadog
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_STAGING }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_STAGING }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env staging \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_STAGING }} \
+            --out-dir terraform/environments/staging
+          echo "=== Live sync complete (staging) ==="
+          cat terraform/environments/staging/drift_report.txt
 
       - name: Terraform Init
         working-directory: terraform/environments/staging
@@ -138,19 +186,37 @@ jobs:
       always() &&
       needs.detect-changes.outputs.prod == 'true' &&
       (needs.apply-staging.result == 'success' || needs.apply-staging.result == 'skipped')
-    # "prod-deploy" environment MUST have required reviewers set in Gitea UI.
-    # The job PAUSES here until a designated approver clicks "Approve" in the UI.
-    environment: prod-deploy
+    # KEY BYPASS LOGIC:
+    #   automation branch → prod-deploy-auto (no required reviewers, no wait timer)
+    #   main branch       → prod-deploy      (2 required reviewers + 5-min wait timer)
+    environment: ${{ needs.detect-changes.outputs.is_automation == 'true' && 'prod-deploy-auto' || 'prod-deploy' }}
     concurrency:
       group: tf-apply-prod
-      cancel-in-progress: false  # Never cancel a running prod apply
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live pipeline state from Datadog
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_PROD }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_PROD }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env prod \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_PROD }} \
+            --out-dir terraform/environments/prod
+          echo "=== Live sync complete (prod) ==="
+          cat terraform/environments/prod/drift_report.txt
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
@@ -167,7 +233,7 @@ jobs:
           AWS_ACCESS_KEY_ID:      ${{ secrets.TF_STATE_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY:  ${{ secrets.TF_STATE_SECRET_KEY }}
         run: |
-          echo "=== Final plan before prod apply ==="
+          echo "=== Final plan before prod apply (branch: ${{ gitea.ref_name }}) ==="
           terraform plan -no-color
 
       - name: Terraform Apply — Production
@@ -183,17 +249,13 @@ jobs:
         if: success()
         run: |
           echo "✅ Production Observability Pipeline processors updated successfully"
+          echo "Branch: ${{ gitea.ref_name }}"
           echo "Commit: ${{ gitea.sha }}"
-          echo "Actor: ${{ gitea.actor }}"
+          echo "Actor:  ${{ gitea.actor }}"
 
       - name: Prod apply failed — alert
         if: failure()
         run: |
           echo "::error::PRODUCTION APPLY FAILED"
-          echo "Commit: ${{ gitea.sha }}"
-          # Add PagerDuty / Slack / email webhook call here
-          # Example:
-          # curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
-          #   -H 'Content-type: application/json' \
-          #   --data '{"text":"🚨 PROD Datadog OP Terraform apply FAILED on commit ${{ gitea.sha }}"}'
+          echo "Branch: ${{ gitea.ref_name }} | Commit: ${{ gitea.sha }}"
           exit 1

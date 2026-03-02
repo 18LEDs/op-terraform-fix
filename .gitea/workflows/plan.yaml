@@ -3,6 +3,11 @@
 # Triggered on every Pull Request / Merge Request targeting main or any
 # environment branch. Runs terraform plan and posts the output as a PR comment.
 # This is the primary GATE — reviewers must see a passing plan before merging.
+#
+# Live-sync: Before every plan, the current Datadog API state is fetched and
+# written to live_processors.auto.tfvars.json so the plan always reflects
+# real pipeline state, not stale repo values. Drift between live and repo
+# is reported as a warning in the PR comment.
 
 name: "Terraform Plan"
 
@@ -18,8 +23,8 @@ on:
 env:
   TF_VERSION: "1.7.5"
   TF_IN_AUTOMATION: "true"
-  # Prevents interactive prompts in CI
   TF_INPUT: "false"
+  PYTHON_VERSION: "3.11"
 
 jobs:
   # ── Determine which environments changed ──────────────────────────────────
@@ -99,14 +104,33 @@ jobs:
     runs-on: ubuntu-latest
     needs: [detect-changes, validate]
     if: needs.detect-changes.outputs.dev == 'true'
-    environment: dev-plan  # read-only environment — no approval gate needed for plan
+    environment: dev-plan
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Live sync: pull current state from Datadog before planning ──────
+      - name: Sync live pipeline state from Datadog
+        id: sync
+        working-directory: .
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_DEV }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_DEV }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env dev \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_DEV }} \
+            --out-dir terraform/environments/dev
+          echo "drift=$(cat terraform/environments/dev/drift_report.txt | head -1)" >> "$GITHUB_OUTPUT"
 
       - name: Terraform Init
         working-directory: terraform/environments/dev
@@ -133,22 +157,12 @@ jobs:
           script: |
             const fs = require('fs');
             const plan = fs.readFileSync('terraform/environments/dev/plan_output.txt', 'utf8');
-            const maxLen = 65000;
-            const truncated = plan.length > maxLen
-              ? plan.substring(0, maxLen) + '\n\n... [truncated — see runner logs for full output]'
-              : plan;
-
-            const body = `## 🔍 Terraform Plan — Dev
-            <details>
-            <summary>Click to expand plan output</summary>
-
-            \`\`\`hcl
-            ${truncated}
-            \`\`\`
-            </details>
-
-            *Triggered by: @${{ gitea.actor }} | Commit: \`${{ gitea.sha }}\`*`;
-
+            const drift = fs.readFileSync('terraform/environments/dev/drift_report.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n...[truncated]' : plan;
+            const driftSection = drift.startsWith('DRIFT')
+              ? `\n> ⚠️ **Live vs Repo Drift Detected:**\n> \`\`\`\n> ${drift.replace(/\n/g, '\n> ')}\n> \`\`\`\n`
+              : '\n> ✅ Live Datadog state matches repo — no drift.\n';
+            const body = `## 🔍 Terraform Plan — Dev\n${driftSection}\n<details><summary>Full plan output</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n</details>\n\n*Triggered by: @${{ gitea.actor }} | Commit: \`${{ gitea.sha }}\`*`;
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -169,10 +183,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live pipeline state from Datadog
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_STAGING }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_STAGING }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env staging \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_STAGING }} \
+            --out-dir terraform/environments/staging
 
       - name: Terraform Init
         working-directory: terraform/environments/staging
@@ -198,12 +227,16 @@ jobs:
           script: |
             const fs = require('fs');
             const plan = fs.readFileSync('terraform/environments/staging/plan_output.txt', 'utf8');
-            const truncated = plan.length > 65000 ? plan.substring(0, 65000) + '\n...[truncated]' : plan;
+            const drift = fs.readFileSync('terraform/environments/staging/drift_report.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n...[truncated]' : plan;
+            const driftSection = drift.startsWith('DRIFT')
+              ? `\n> ⚠️ **Live vs Repo Drift Detected:**\n> \`\`\`\n> ${drift.replace(/\n/g, '\n> ')}\n> \`\`\`\n`
+              : '\n> ✅ Live Datadog state matches repo — no drift.\n';
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## 🔍 Terraform Plan — Staging\n\n<details><summary>Expand</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n</details>`
+              body: `## 🔍 Terraform Plan — Staging\n${driftSection}\n<details><summary>Expand</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n</details>`
             });
 
   # ── Plan: Prod ────────────────────────────────────────────────────────────
@@ -215,10 +248,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Sync live pipeline state from Datadog
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY_PROD }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY_PROD }}
+        run: |
+          python3 scripts/sync_live_state.py \
+            --env prod \
+            --pipeline-ids ${{ secrets.DD_PIPELINE_IDS_PROD }} \
+            --out-dir terraform/environments/prod
 
       - name: Terraform Init
         working-directory: terraform/environments/prod
@@ -245,25 +293,13 @@ jobs:
           script: |
             const fs = require('fs');
             const plan = fs.readFileSync('terraform/environments/prod/plan_output.txt', 'utf8');
-            const truncated = plan.length > 65000 ? plan.substring(0, 65000) + '\n...[truncated]' : plan;
-
-            // Extract summary line for visibility
+            const drift = fs.readFileSync('terraform/environments/prod/drift_report.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n...[truncated]' : plan;
             const summary = plan.match(/Plan: .*/)?.[0] || 'See details';
-
-            const body = `## ⚠️ Terraform Plan — **PRODUCTION**
-
-            > **${summary}**
-            > This MR will modify production Observability Pipeline processors.
-            > Two approvals required before merge is permitted.
-
-            <details>
-            <summary>Full plan output</summary>
-
-            \`\`\`hcl
-            ${truncated}
-            \`\`\`
-            </details>`;
-
+            const driftSection = drift.startsWith('DRIFT')
+              ? `\n> ⚠️ **Live vs Repo Drift Detected — review carefully before approving:**\n> \`\`\`\n> ${drift.replace(/\n/g, '\n> ')}\n> \`\`\`\n`
+              : '\n> ✅ Live Datadog state matches repo — no drift.\n';
+            const body = `## ⚠️ Terraform Plan — **PRODUCTION**\n\n> **${summary}**\n> This MR will modify production Observability Pipeline processors.\n> Two approvals required before merge is permitted.\n${driftSection}\n<details>\n<summary>Full plan output</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n</details>`;
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
